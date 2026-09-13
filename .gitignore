@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# py2app build outputs (rebuild with: python setup.py py2app)
+build/
+dist/
+
+# macOS
+.DS_Store
+
+# Local run artifacts
+*.log
