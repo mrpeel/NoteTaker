@@ -19,9 +19,10 @@ from datetime import datetime
 from functools import wraps
 from pathlib import Path
 
-from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
+    QCursor,
     QIcon,
     QKeySequence,
     QMouseEvent,
@@ -408,6 +409,7 @@ class ScratchpadHUD(QWidget):
         self._start_global_hotkeys()
         self._wire_shortcuts()
         self._build_tray()
+        self._start_space_watcher()
 
     # -- UI ---------------------------------------------------------------
     def _build_ui(self) -> None:
@@ -512,6 +514,49 @@ class ScratchpadHUD(QWidget):
     def _on_tray_activated(self, reason) -> None:
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self.toggle_visibility()
+
+    def _start_space_watcher(self) -> None:
+        """Follow the active screen when the user swipes Spaces (macOS).
+
+        Without this, a visible HUD stays parked on the old display while
+        you work fullscreen on another one. Only acts while visible, so a
+        hidden HUD never jumps around behind your back.
+        """
+        self._space_observer = None
+        if sys.platform != "darwin":
+            return
+        try:
+            from Cocoa import NSObject
+            from Foundation import NSWorkspace
+        except Exception as exc:
+            print(f"[hud] space watcher unavailable: {exc}", file=sys.stderr)
+            return
+
+        hud = self
+
+        class _SpaceObserver(NSObject):
+            def activeSpaceChanged_(self, _note) -> None:
+                try:
+                    if hud.isVisible():
+                        hud._move_to_active_screen()
+                except Exception:
+                    pass
+
+        try:
+            observer = _SpaceObserver.alloc().init()
+            (
+                NSWorkspace.sharedWorkspace()
+                .notificationCenter()
+                .addObserver_selector_name_object_(
+                    observer,
+                    "activeSpaceChanged:",
+                    "NSWorkspaceActiveSpaceDidChangeNotification",
+                    None,
+                )
+            )
+            self._space_observer = observer  # keep alive
+        except Exception as exc:
+            print(f"[hud] space watcher failed: {exc}", file=sys.stderr)
 
     def _apply_style(self) -> None:
         # Window backdrop + border are painted in paintEvent (reliable with
@@ -747,11 +792,46 @@ class ScratchpadHUD(QWidget):
 
     @safe_slot
     def _force_show(self) -> None:
-        """Show + focus, used by the hotkey toggle and 2nd-instance nudges."""
+        """Show + focus, used by hotkey toggle, 2nd-instance nudges, launch."""
+        self._move_to_active_screen()
         self.show()
         self.raise_()
         self.activateWindow()
         self.input.setFocus()
+
+    def _move_to_active_screen(self) -> bool:
+        """Move the HUD to the screen holding the cursor (the active one).
+
+        Multi-monitor fullscreen users swipe Spaces per display; a stationary
+        window otherwise sits on the display it was last placed on. The
+        cursor is the best proxy for "the screen I'm looking at".
+        Preserves the window's relative position; returns True if it moved.
+        """
+        try:
+            pos = QCursor.pos()
+            target = QApplication.screenAt(pos) or QApplication.primaryScreen()
+            if target is None:
+                return False
+            current = self.screen()
+            if current is None:
+                # Hidden widgets report no screen; fall back to geometry.
+                current = QApplication.screenAt(self.frameGeometry().center())
+            if current is not None and current.name() == target.name():
+                return False
+            tgeo = target.availableGeometry()
+            if current is not None:
+                rel = self.pos() - current.availableGeometry().topLeft()
+            else:
+                rel = QPoint(100, 100)
+            new = tgeo.topLeft() + rel
+            # Clamp fully inside the target screen.
+            new.setX(min(max(new.x(), tgeo.left()), tgeo.right() - self.width()))
+            new.setY(min(max(new.y(), tgeo.top()), tgeo.bottom() - self.height()))
+            self.move(new)
+            return True
+        except Exception:
+            log_exception("ScratchpadHUD._move_to_active_screen")
+            return False
 
     # -- Cleanup ------------------------------------------------------------
     def closeEvent(self, event) -> None:  # noqa: N802, ANN001
@@ -835,7 +915,7 @@ def main() -> int:
     app.setQuitOnLastWindowClosed(True)
     hud = ScratchpadHUD()
     guard.on_activate = hud._bridge.activate_requested.emit
-    hud.show()
+    hud._force_show()  # lands on the active screen, then stays visible
     _apply_macos_space_behavior(hud)  # follow fullscreen apps across Spaces
     return app.exec()
 
