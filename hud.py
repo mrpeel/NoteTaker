@@ -763,6 +763,45 @@ class ScratchpadHUD(QWidget):
             super().closeEvent(event)
 
 
+def _apply_macos_space_behavior(window: QWidget) -> bool:
+    """Keep the HUD visible on every Space, including fullscreen apps.
+
+    Qt's WindowStaysOnTopHint stops at Space boundaries: a fullscreen app
+    lives in its own Space where the HUD isn't present — and toggling it
+    there shows it on the *old* Space, which looks like a dead hotkey.
+    Joining all Spaces as a fullscreen-auxiliary panel fixes both symptoms.
+    Returns True when the behavior was applied.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        import objc
+        from AppKit import (
+            NSWindowCollectionBehaviorCanJoinAllSpaces,
+            NSWindowCollectionBehaviorFullScreenAuxiliary,
+            NSWindowCollectionBehaviorStationary,
+        )
+        from ctypes import c_void_p
+    except Exception as exc:
+        print(f"[hud] spaces fix unavailable: {exc}", file=sys.stderr)
+        return False
+    try:
+        window.winId()  # ensure the native NSView exists
+        nsview = objc.objc_object(c_void_p=int(window.winId()))
+        nswindow = nsview.window()
+        if nswindow is None:
+            return False
+        nswindow.setCollectionBehavior_(
+            NSWindowCollectionBehaviorCanJoinAllSpaces
+            | NSWindowCollectionBehaviorStationary
+            | NSWindowCollectionBehaviorFullScreenAuxiliary
+        )
+        return True
+    except Exception as exc:
+        print(f"[hud] spaces fix failed: {exc}", file=sys.stderr)
+        return False
+
+
 def _install_crash_handlers() -> None:
     faulthandler.enable()
 
@@ -797,6 +836,7 @@ def main() -> int:
     hud = ScratchpadHUD()
     guard.on_activate = hud._bridge.activate_requested.emit
     hud.show()
+    _apply_macos_space_behavior(hud)  # follow fullscreen apps across Spaces
     return app.exec()
 
 
