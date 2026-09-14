@@ -22,11 +22,13 @@ from pathlib import Path
 from PyQt6.QtCore import QEvent, QObject, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
+    QIcon,
     QKeySequence,
     QMouseEvent,
     QPaintEvent,
     QPainter,
     QPen,
+    QPixmap,
     QShortcut,
 )
 from PyQt6.QtWidgets import (
@@ -35,8 +37,10 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QPushButton,
     QSizePolicy,
+    QSystemTrayIcon,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -403,6 +407,7 @@ class ScratchpadHUD(QWidget):
         self.new_session()
         self._start_global_hotkeys()
         self._wire_shortcuts()
+        self._build_tray()
 
     # -- UI ---------------------------------------------------------------
     def _build_ui(self) -> None:
@@ -466,11 +471,47 @@ class ScratchpadHUD(QWidget):
         self.input.returnPressed.connect(self.add_note)
         root.addWidget(self.input)
 
-        # Session timer
-        self.tick = QTimer(self)
-        self.tick.setInterval(1000)
-        self.tick.timeout.connect(self._update_timer)
-        self.tick.start()
+    def _build_tray(self) -> None:
+        """Menu-bar tray icon: the exit hatch for a dock-less agent app.
+
+        Single click toggles the HUD; right-click offers Show/Hide + Quit.
+        Without this, a hidden HUD can never be quit except via kill.
+        """
+        self.tray = None
+        self.tray_show_action = None
+        self.tray_quit_action = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            print("[hud] system tray unavailable; no tray icon", file=sys.stderr)
+            return
+        pm = QPixmap(32, 32)
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(QColor("#4EC9B0"))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(4, 4, 24, 24)
+        painter.end()
+
+        self.tray = QSystemTrayIcon(QIcon(pm), self)
+        self.tray.setToolTip("MeetingHUD — meeting scratchpad")
+        menu = QMenu()
+        # QAction.triggered passes checked(bool); toggle_visibility accepts it.
+        self.tray_show_action = menu.addAction("Show / Hide")
+        self.tray_show_action.triggered.connect(self.toggle_visibility)
+        menu.addSeparator()
+        self.tray_quit_action = menu.addAction("Quit MeetingHUD")
+        app = QApplication.instance()
+        if app is not None:
+            # QApplication.quit is a C++ slot: extra triggered(bool) arg dropped.
+            self.tray_quit_action.triggered.connect(app.quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+    @safe_slot
+    def _on_tray_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.toggle_visibility()
 
     def _apply_style(self) -> None:
         # Window backdrop + border are painted in paintEvent (reliable with
@@ -564,7 +605,7 @@ class ScratchpadHUD(QWidget):
         self.session_start = now
         self.note_count = 0
         self.feed.clear()
-        self._update_timer()
+        self.session_label.setText(self.session_id)
 
     def _set_save_state(self, ok: bool) -> None:
         """Green dot = saving works; red dot = last write FAILED (see tooltip)."""
@@ -663,16 +704,6 @@ class ScratchpadHUD(QWidget):
         self._flash = False
         self.update()
 
-    @safe_slot
-    def _update_timer(self) -> None:
-        if self.session_start is None:
-            return
-        elapsed = int((datetime.now().astimezone() - self.session_start).total_seconds())
-        mm, ss = divmod(elapsed, 60)
-        hh, mm = divmod(mm, 60)
-        clock = f"{hh:02d}:{mm:02d}:{ss:02d}" if hh else f"{mm:02d}:{ss:02d}"
-        self.session_label.setText(f"{clock}  ·  {self.session_id}")
-
     # -- Global hotkey (pynput, background thread) -------------------------
     def _start_global_hotkeys(self) -> None:
         try:
@@ -708,7 +739,7 @@ class ScratchpadHUD(QWidget):
         self._hotkey_thread.start()
 
     @safe_slot
-    def toggle_visibility(self) -> None:
+    def toggle_visibility(self, _checked: bool = False) -> None:
         if self.isVisible():
             self.hide()
         else:
@@ -725,8 +756,6 @@ class ScratchpadHUD(QWidget):
     # -- Cleanup ------------------------------------------------------------
     def closeEvent(self, event) -> None:  # noqa: N802, ANN001
         try:
-            if self.tick is not None:
-                self.tick.stop()
             listener = getattr(self, "_hotkey_listener", None)
             if listener is not None:
                 listener.stop()

@@ -40,7 +40,9 @@ Without these, everything works except the global hotkey.
 | `Cmd+Q` | Quit the app |
 
 Drag by the header strip. Only one instance runs at a time — launching again
-just brings the existing HUD forward. Optional: add to Login Items.
+just brings the existing HUD forward. A teal dot in the menu bar opens
+Show / Hide and **Quit** (or `Cmd+Q` while the HUD is focused) — there is no
+Dock icon, so the tray is the way out. Optional: add to Login Items.
 
 ## Install on another Mac
 
