@@ -61,12 +61,28 @@ def log_exception(where: str) -> None:
     """Log slot exceptions to stderr + file instead of aborting (PyQt6 qFatals)."""
     text = f"[hud:{where}] unhandled exception:\n{traceback.format_exc()}"
     print(text, file=sys.stderr)
+    _append_log(text)
+
+
+def _append_log(text: str) -> None:
     try:
         ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
         with ERROR_LOG.open("a", encoding="utf-8") as f:
             f.write(f"{datetime.now().astimezone().isoformat()} {text}\n")
     except Exception:
         pass
+
+
+def macos_accessibility_trusted() -> bool | None:
+    """None off-macOS; otherwise whether the key-tap grant is in place."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        from ApplicationServices import AXIsProcessTrusted
+
+        return bool(AXIsProcessTrusted())
+    except Exception:
+        return None
 
 
 def safe_slot(fn):
@@ -278,25 +294,33 @@ class SingleInstance:
         except OSError:
             if self._notify_primary():
                 return False
-            # Stale socket file (previous crash): take over.
+            # Stale socket file (previous crash): take over with a fresh fd.
             try:
                 Path(self.path).unlink()
             except OSError:
                 pass
-            self.sock.bind(self.path)
+            try:
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.bind(self.path)
+            except OSError:
+                # Still bound (racy sibling) — bow out quietly.
+                print("[hud] another instance is running.", file=sys.stderr)
+                return False
         self.sock.listen(1)
         self.is_primary = True
         threading.Thread(target=self._serve, daemon=True).start()
         return True
 
     def _notify_primary(self) -> bool:
+        """Ping the primary and require an ack; ghosts don't ack."""
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(2)
             s.connect(self.path)
             s.sendall(b"show")
+            ack = s.recv(2)
             s.close()
-            return True
+            return ack == b"ok"
         except OSError:
             return False
 
@@ -307,6 +331,9 @@ class SingleInstance:
                 conn, _ = self.sock.accept()
                 try:
                     conn.recv(16)
+                    conn.sendall(b"ok")
+                except OSError:
+                    pass
                 finally:
                     conn.close()
                 if self.on_activate is not None:
@@ -386,8 +413,10 @@ class ScratchpadHUD(QWidget):
         self._drag_pos: object = None  # QPoint | None (kept untyped for Qt6 compat)
         self._flash: bool = False  # red-border reset confirmation (painted)
         self._save_ok: bool = True  # False after a failed vault write (red dot)
+        self._hotkey_ok: bool | None = None  # False while key-tap grant missing
         self._hotkey_listener = None
         self._hotkey_thread: threading.Thread | None = None
+        self._trust_timer: QTimer | None = None
 
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
@@ -653,19 +682,28 @@ class ScratchpadHUD(QWidget):
         self.session_label.setText(self.session_id)
 
     def _set_save_state(self, ok: bool) -> None:
-        """Green dot = saving works; red dot = last write FAILED (see tooltip)."""
+        """Green dot = healthy; red dot = save failed OR hotkey untrusted."""
         self._save_ok = ok
-        self.dot.setProperty("alert", "false" if ok else "true")
-        # Dynamic property change needs a polish cycle to re-apply QSS.
-        self.dot.style().unpolish(self.dot)
-        self.dot.style().polish(self.dot)
-        if ok:
-            self.dot.setToolTip("")
-        else:
-            self.dot.setToolTip(
+        self._refresh_dot()
+
+    def _refresh_dot(self) -> None:
+        tips = []
+        if not self._save_ok:
+            tips.append(
                 "Last save FAILED — notes may only exist on screen. "
                 "Check disk space/permissions and retry."
             )
+        if self._hotkey_ok is False:
+            tips.append(
+                "Global hotkey INACTIVE — enable Accessibility (+ Input "
+                "Monitoring) for MeetingHUD in System Settings, then relaunch."
+            )
+        alert = bool(tips)
+        self.dot.setProperty("alert", "true" if alert else "false")
+        # Dynamic property change needs a polish cycle to re-apply QSS.
+        self.dot.style().unpolish(self.dot)
+        self.dot.style().polish(self.dot)
+        self.dot.setToolTip(" ".join(tips))
 
     def _confirm(self, title: str, body: str, confirm_text: str, cancel_text: str) -> bool:
         dlg = ConfirmDialog(self, title, body, confirm_text, cancel_text)
@@ -760,6 +798,7 @@ class ScratchpadHUD(QWidget):
         bridge = self._bridge
 
         def on_toggle() -> None:
+            _append_log("[hud] hotkey fired")
             bridge.toggle_requested.emit()
 
         hotkeys = {
@@ -782,13 +821,43 @@ class ScratchpadHUD(QWidget):
 
         self._hotkey_thread = threading.Thread(target=run, daemon=True)
         self._hotkey_thread.start()
+        self._check_hotkey_trust()
+        # Re-check the grant every 30s until present (user may grant mid-run,
+        # though macOS usually requires a relaunch for taps to start working).
+        timer = QTimer(self)
+        timer.setInterval(30000)
+        timer.timeout.connect(self._check_hotkey_trust)
+        timer.start()
+        self._trust_timer = timer
+
+    @safe_slot
+    def _check_hotkey_trust(self) -> None:
+        trusted = macos_accessibility_trusted()
+        if trusted is None:
+            return
+        self._hotkey_ok = trusted
+        if not trusted:
+            print(
+                "[hud] WARNING: not Accessibility-trusted; the global hotkey "
+                "cannot fire. Enable Accessibility (+ Input Monitoring) for "
+                "MeetingHUD in System Settings, then relaunch.",
+                file=sys.stderr,
+            )
+        elif self._trust_timer is not None:
+            self._trust_timer.stop()
+            self._trust_timer = None
+        self._refresh_dot()
 
     @safe_slot
     def toggle_visibility(self, _checked: bool = False) -> None:
         if self.isVisible():
             self.hide()
+            _append_log("[hud] toggle -> hidden")
         else:
             self._force_show()
+            screen = self.screen()
+            name = screen.name() if screen is not None else "?"
+            _append_log(f"[hud] toggle -> shown on {name} at {self.pos().x()},{self.pos().y()}")
 
     @safe_slot
     def _force_show(self) -> None:
@@ -836,6 +905,8 @@ class ScratchpadHUD(QWidget):
     # -- Cleanup ------------------------------------------------------------
     def closeEvent(self, event) -> None:  # noqa: N802, ANN001
         try:
+            if self._trust_timer is not None:
+                self._trust_timer.stop()
             listener = getattr(self, "_hotkey_listener", None)
             if listener is not None:
                 listener.stop()

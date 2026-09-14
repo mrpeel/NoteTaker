@@ -29,6 +29,19 @@ The global toggle hotkey installs a system key tap, which macOS attributes to
 
 Without these, everything works except the global hotkey.
 
+### Hotkey not firing? Diagnose in order
+
+1. **Grants missing (most common).** On launch without them you get
+   `[hud] WARNING: not Accessibility-trusted…`, and the header dot turns
+   red — hover it for the reason. Grant, relaunch, done.
+2. **Toggled on the wrong screen?** Every show lands on the display holding
+   your cursor, and swiping Spaces pulls a visible HUD along. If you still
+   can't see it, check the other display before assuming the hotkey died.
+3. **Still dead?** Each press appends `hotkey fired` + `toggle -> …` lines to
+   `~/workspace/notes_vault/hud_errors.log`. Press the combo on each screen,
+   then check the file: lines present = tap works, look for the window;
+   absent = macOS is swallowing the tap (re-check permissions, relaunch).
+
 ### Everyday use
 
 | Hotkey | Action |
